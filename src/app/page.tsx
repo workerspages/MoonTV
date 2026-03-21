@@ -4,8 +4,8 @@
 
 import { ChevronRight, Film, Tv, Calendar, Sparkles, Play, Trash2 } from 'lucide-react';
 import Link from 'next/link';
-import { Suspense, useEffect, useState, useRef, useMemo, useReducer } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { Suspense, useEffect, useState, useRef, useMemo, useReducer, useTransition } from 'react';
+import { useQuery } from '@tanstack/react-query';
 
 import {
   BangumiCalendarData,
@@ -16,7 +16,6 @@ import { ShortDramaItem, ReleaseCalendarItem } from '@/lib/types';
 import {
   getAllFavorites,
   getAllPlayRecords,
-  subscribeToDataUpdates,
 } from '@/lib/db.client';
 // 🚀 TanStack Query Mutations
 import { useClearFavoritesMutation } from '@/hooks/useFavoritesMutations';
@@ -111,9 +110,6 @@ const homeReducer = (state: HomeState, action: HomeAction): HomeState => {
 };
 
 function HomeClient() {
-  // 🚀 TanStack Query - 全局缓存管理
-  const queryClient = useQueryClient();
-
   // 🚀 TanStack Query - 首页数据查询（替代 GlobalCache）
   const {
     data: homeData,
@@ -122,6 +118,9 @@ function HomeClient() {
     errors: homeErrors,
     refetch: refetchHomeData,
   } = useHomePageQueries();
+
+  // 🎯 优化：使用 useTransition 让 tab 切换不阻塞 UI
+  const [isPending, startTransition] = useTransition();
 
   // 🎯 优化：使用 useReducer 合并本地状态
   const [state, dispatch] = useReducer(homeReducer, {
@@ -616,32 +615,6 @@ function HomeClient() {
   // 特性：乐观更新（立即清空 UI）+ 错误回滚（失败时恢复数据）
   const clearFavoritesMutation = useClearFavoritesMutation();
 
-  // 🚀 TanStack Query - 监听数据更新事件，自动刷新缓存
-  useEffect(() => {
-    // 监听收藏更新事件
-    const unsubscribeFavorites = subscribeToDataUpdates(
-      'favoritesUpdated',
-      () => {
-        // 刷新收藏数据缓存
-        queryClient.invalidateQueries({ queryKey: ['favorites'] });
-      }
-    );
-
-    // 监听播放记录更新事件
-    const unsubscribePlayRecords = subscribeToDataUpdates(
-      'playRecordsUpdated',
-      () => {
-        // 刷新播放记录缓存
-        queryClient.invalidateQueries({ queryKey: ['playRecords'] });
-      }
-    );
-
-    return () => {
-      unsubscribeFavorites();
-      unsubscribePlayRecords();
-    };
-  }, [queryClient]); // 依赖 queryClient
-
   const handleCloseAnnouncement = (announcement: string) => {
     dispatch({ type: 'SET_SHOW_ANNOUNCEMENT', payload: false });
     localStorage.setItem('hasSeenAnnouncement', announcement); // 记录已查看弹窗
@@ -694,11 +667,11 @@ function HomeClient() {
               { label: '收藏夹', value: 'favorites' },
             ]}
             active={activeTab}
-            onChange={(value) => dispatch({ type: 'SET_ACTIVE_TAB', payload: value as 'home' | 'favorites' })}
+            onChange={(value) => startTransition(() => dispatch({ type: 'SET_ACTIVE_TAB', payload: value as 'home' | 'favorites' }))}
           />
         </div>
 
-        <div className='w-full mx-auto'>
+        <div className={`w-full mx-auto ${isPending ? 'opacity-70 transition-opacity duration-150' : ''}`}>
           {activeTab === 'favorites' ? (
             // 收藏夹视图
             <section className='mb-8'>

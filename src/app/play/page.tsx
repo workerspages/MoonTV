@@ -4,11 +4,12 @@
 
 'use client';
 
-import { Suspense, useEffect, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import { Heart, ChevronUp, Download, X } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
+import { toast } from 'sonner';
 
 import { useDownload } from '@/contexts/DownloadContext';
 import { useDanmu } from '@/hooks/useDanmu';
@@ -70,6 +71,26 @@ import {
   usePrefetchDoubanData,
 } from './hooks/usePlayPagePrefetch';
 
+// 播放速率持久化
+const PLAYER_PLAYBACK_RATE_KEY = 'moontv_player_playback_rate';
+
+function sanitizePlaybackRate(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 1.0;
+  const allowedRates = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+  return allowedRates.includes(value) ? value : 1.0;
+}
+
+function loadPlaybackRate(): number {
+  if (typeof window === 'undefined') return 1.0;
+  try {
+    const raw = localStorage.getItem(PLAYER_PLAYBACK_RATE_KEY);
+    if (!raw) return 1.0;
+    return sanitizePlaybackRate(Number(raw));
+  } catch {
+    return 1.0;
+  }
+}
+
 // 扩展 HTMLVideoElement 类型以支持 hls 属性
 declare global {
   interface HTMLVideoElement {
@@ -117,6 +138,8 @@ function PlayPageClient() {
 
   // 收藏状态
   const [favorited, setFavorited] = useState(false);
+  // 追踪当前收藏实际存储的 key（source+id），用于切换源后正确删除
+  const favoritedKeyRef = useRef<string | null>(null);
 
   // 返回顶部按钮显示状态
   const [showBackToTop, setShowBackToTop] = useState(false);
@@ -334,6 +357,15 @@ function PlayPageClient() {
     searchParams.get('source') || ''
   );
   const [currentId, setCurrentId] = useState(searchParams.get('id') || '');
+
+  // 解析 source 参数以获取 embyKey（仅用于 API 调用）
+  const parseSourceForApi = (source: string): { source: string; embyKey?: string } => {
+    if (source.startsWith('emby_')) {
+      const key = source.substring(5);
+      return { source: 'emby', embyKey: key };
+    }
+    return { source };
+  };
 
   // 短剧ID（用于获取详情显示，不影响源搜索）
   const [shortdramaId] = useState(searchParams.get('shortdrama_id') || '');
@@ -707,13 +739,14 @@ function PlayPageClient() {
   const resumeTimeRef = useRef<number | null>(null);
   // 上次使用的音量，默认 0.7
   const lastVolumeRef = useRef<number>(0.7);
-  // 上次使用的播放速率，默认 1.0
-  const lastPlaybackRateRef = useRef<number>(1.0);
+  // 上次使用的播放速率，从 localStorage 恢复
+  const lastPlaybackRateRef = useRef<number>(loadPlaybackRate());
 
   const [sourceSearchLoading, setSourceSearchLoading] = useState(false);
   const [sourceSearchError, setSourceSearchError] = useState<string | null>(
     null
   );
+  const [backgroundSourcesLoading, setBackgroundSourcesLoading] = useState(false);
 
   // 优选和测速开关
   const [optimizationEnabled] = useState<boolean>(() => {
@@ -2395,7 +2428,8 @@ function PlayPageClient() {
   useEffect(() => {
     const fetchSourceDetail = async (
       source: string,
-      id: string
+      id: string,
+      title?: string
     ): Promise<SearchResult[]> => {
       try {
         let detailResponse;
@@ -2410,31 +2444,30 @@ function PlayPageClient() {
             `/api/shortdrama/detail?id=${id}&episode=1${titleParam}`
           );
         } else {
+          // 所有其他源（包括 Emby）统一使用 /api/detail
+          // 添加 title 参数用于搜索匹配
+          const titleParam = title ? `&title=${encodeURIComponent(title)}` : '';
           detailResponse = await fetch(
-            `/api/detail?source=${source}&id=${id}`
+            `/api/detail?source=${source}&id=${id}${titleParam}`
           );
         }
 
         if (!detailResponse.ok) {
           throw new Error('获取视频详情失败');
         }
+
         const detailData = (await detailResponse.json()) as SearchResult;
 
-        // 检查是否有有效的集数数据
-        if (!detailData.episodes || detailData.episodes.length === 0) {
-          throw new Error('该源没有可用的集数数据');
-        }
-
-        // 对于短剧源，还需要检查 title 和 poster 是否有效
+        // 对于短剧源，检查 title 和 poster 是否有效
         if (source === 'shortdrama') {
           if (!detailData.title || !detailData.poster) {
             throw new Error('短剧源数据不完整（缺少标题或海报）');
           }
         }
 
-        // 只有数据有效时才设置 availableSources
-        // 注意：这里不应该直接设置，因为后续逻辑会统一设置
-        // setAvailableSources([detailData]);
+        // 注意：不检查episodes是否为空，因为有些源可能需要后续处理
+        // 即使episodes为空，也返回数据，让调用方决定如何处理
+
         return [detailData];
       } catch (err) {
         console.error('获取视频详情失败:', err);
@@ -2471,43 +2504,54 @@ function PlayPageClient() {
 
             // 移除早期退出策略，让downstream的相关性评分发挥作用
 
-            // 处理搜索结果，使用智能模糊匹配（与downstream评分逻辑保持一致）
-            const filteredResults = data.results.filter(
+            // 处理搜索结果，使用分级匹配：精确匹配优先，避免短标题误匹配
+            const queryTitle = videoTitleRef.current.replaceAll(' ', '').toLowerCase();
+
+            const matchYearAndType = (result: SearchResult) => {
+              const yearMatch = videoYearRef.current
+                ? result.year.toLowerCase() === videoYearRef.current.toLowerCase()
+                : true;
+              const typeMatch = searchType
+                ? (searchType === 'tv' && result.episodes.length > 1) ||
+                  (searchType === 'movie' && result.episodes.length === 1)
+                : true;
+              return yearMatch && typeMatch;
+            };
+
+            // 第一优先级：精确匹配（标题完全相等，或去除数字/标点后相等）
+            const exactResults = data.results.filter(
               (result: SearchResult) => {
-                // 如果有 douban_id，优先使用 douban_id 精确匹配
                 if (videoDoubanIdRef.current && videoDoubanIdRef.current > 0 && result.douban_id) {
                   return result.douban_id === videoDoubanIdRef.current;
                 }
-
-                const queryTitle = videoTitleRef.current.replaceAll(' ', '').toLowerCase();
                 const resultTitle = result.title.replaceAll(' ', '').toLowerCase();
-
-                // 智能标题匹配：支持数字变体和标点符号变化
-                // 优先使用精确包含匹配，避免短标题（如"玫瑰"）匹配到包含该字的其他电影（如"玫瑰的故事"）
-                const titleMatch = resultTitle.includes(queryTitle) ||
-                  queryTitle.includes(resultTitle) ||
-                  // 移除数字和标点后匹配（针对"死神来了：血脉诅咒" vs "死神来了6：血脉诅咒"）
-                  resultTitle.replace(/\d+|[：:]/g, '') === queryTitle.replace(/\d+|[：:]/g, '') ||
-                  // 通用关键词匹配：仅当查询标题较长时（4个字符以上）才使用关键词匹配
-                  // 避免短标题（如"玫瑰"2字）被拆分匹配
-                  (queryTitle.length > 4 && checkAllKeywordsMatch(queryTitle, resultTitle));
-
-                const yearMatch = videoYearRef.current
-                  ? result.year.toLowerCase() === videoYearRef.current.toLowerCase()
-                  : true;
-                const typeMatch = searchType
-                  ? (searchType === 'tv' && result.episodes.length > 1) ||
-                    (searchType === 'movie' && result.episodes.length === 1)
-                  : true;
-
-                return titleMatch && yearMatch && typeMatch;
+                const exactMatch = resultTitle === queryTitle ||
+                  resultTitle.replace(/\d+|[：:]/g, '') === queryTitle.replace(/\d+|[：:]/g, '');
+                return exactMatch && matchYearAndType(result);
               }
             );
 
+            // 第二优先级：宽松包含匹配（仅当精确匹配无结果时使用）
+            let filteredResults = exactResults;
+            if (exactResults.length === 0) {
+              filteredResults = data.results.filter(
+                (result: SearchResult) => {
+                  if (videoDoubanIdRef.current && videoDoubanIdRef.current > 0 && result.douban_id) {
+                    return result.douban_id === videoDoubanIdRef.current;
+                  }
+                  const resultTitle = result.title.replaceAll(' ', '').toLowerCase();
+                  const titleMatch = resultTitle.includes(queryTitle) ||
+                    queryTitle.includes(resultTitle) ||
+                    (queryTitle.length > 4 && checkAllKeywordsMatch(queryTitle, resultTitle));
+                  return titleMatch && matchYearAndType(result);
+                }
+              );
+            }
+
             if (filteredResults.length > 0) {
-              console.log(`变体 "${variant}" 找到 ${filteredResults.length} 个精确匹配结果`);
+              console.log(`变体 "${variant}" 找到 ${filteredResults.length} 个匹配结果（${exactResults.length > 0 ? '精确' : '宽松'}匹配）`);
               bestResults = filteredResults;
-              break; // 找到精确匹配就停止
+              break; // 找到匹配就停止
             }
           }
         }
@@ -2564,26 +2608,40 @@ function PlayPageClient() {
             });
           } else {
             // 中文查询：宽松匹配，保持现有行为
-            console.log('使用中文宽松匹配策略');
-            relevantMatches = allCandidates.filter(result => {
-              const title = result.title.toLowerCase();
-              const normalizedQuery = queryTitle.replace(/[^\w\u4e00-\u9fff]/g, '');
-              const normalizedTitle = title.replace(/[^\w\u4e00-\u9fff]/g, '');
+            console.log('使用中文匹配策略（精确优先）');
+            const normalizedQuery = queryTitle.replace(/[^\w\u4e00-\u9fff]/g, '');
 
-              // 包含匹配或50%相似度
-              if (normalizedTitle.includes(normalizedQuery) || normalizedQuery.includes(normalizedTitle)) {
-                console.log(`中文包含匹配: "${result.title}"`);
-                return true;
-              }
-
-              const commonChars = Array.from(normalizedQuery).filter(char => normalizedTitle.includes(char)).length;
-              const similarity = commonChars / normalizedQuery.length;
-              if (similarity >= 0.5) {
-                console.log(`中文相似匹配 (${(similarity*100).toFixed(1)}%): "${result.title}"`);
-                return true;
-              }
-              return false;
+            // 先尝试精确匹配
+            const exactChinese = allCandidates.filter(result => {
+              const normalizedTitle = result.title.toLowerCase().replace(/[^\w\u4e00-\u9fff]/g, '');
+              const isExact = normalizedTitle === normalizedQuery ||
+                normalizedTitle.replace(/\d+/g, '') === normalizedQuery.replace(/\d+/g, '');
+              if (isExact) console.log(`中文精确匹配: "${result.title}"`);
+              return isExact;
             });
+
+            if (exactChinese.length > 0) {
+              relevantMatches = exactChinese;
+            } else {
+              // 精确无结果，降级到包含匹配
+              relevantMatches = allCandidates.filter(result => {
+                const title = result.title.toLowerCase();
+                const normalizedTitle = title.replace(/[^\w\u4e00-\u9fff]/g, '');
+
+                if (normalizedTitle.includes(normalizedQuery) || normalizedQuery.includes(normalizedTitle)) {
+                  console.log(`中文包含匹配: "${result.title}"`);
+                  return true;
+                }
+
+                const commonChars = Array.from(normalizedQuery).filter(char => normalizedTitle.includes(char)).length;
+                const similarity = commonChars / normalizedQuery.length;
+                if (similarity >= 0.5) {
+                  console.log(`中文相似匹配 (${(similarity*100).toFixed(1)}%): "${result.title}"`);
+                  return true;
+                }
+                return false;
+              });
+            }
           }
 
           console.log(`匹配结果: ${relevantMatches.length}/${allCandidates.length}`);
@@ -2628,76 +2686,62 @@ function PlayPageClient() {
           : '🔍 正在搜索播放源...'
       );
 
+      let detailData: SearchResult | null = null;
       let sourcesInfo: SearchResult[] = [];
 
-      // 对于短剧，直接获取详情，跳过搜索
-      if (currentSource === 'shortdrama' && currentId) {
-        sourcesInfo = await fetchSourceDetail(currentSource, currentId);
-        // 只有当短剧源有有效数据时才设置可用源列表
-        if (sourcesInfo.length > 0 && sourcesInfo[0].episodes && sourcesInfo[0].episodes.length > 0) {
-          await setAvailableSourcesWithWeight(sourcesInfo);
-        } else {
-          console.log('⚠️ 短剧源没有有效数据，不设置可用源列表');
-          setAvailableSources([]);
-        }
-      } else {
-        // 其他情况先搜索所有视频源
-        sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
-
-        if (
-          currentSource &&
-          currentId &&
-          !sourcesInfo.some(
-            (source) => source.source === currentSource && source.id === currentId
-          )
-        ) {
-          sourcesInfo = await fetchSourceDetail(currentSource, currentId);
-        }
-
-        // 如果有 shortdrama_id，额外添加短剧源到可用源列表
-        // 即使已经有其他源，也尝试添加短剧源到换源列表中
-        if (shortdramaId) {
-          try {
-            console.log('🔍 尝试获取短剧源详情，ID:', shortdramaId);
-            const shortdramaSource = await fetchSourceDetail('shortdrama', shortdramaId);
-            console.log('📦 短剧源返回数据:', shortdramaSource);
-
-            // 检查短剧源是否有有效数据（必须有 episodes 且 episodes 不为空）
-            if (shortdramaSource.length > 0 &&
-                shortdramaSource[0].episodes &&
-                shortdramaSource[0].episodes.length > 0) {
-              console.log('✅ 短剧源有有效数据，episodes 数量:', shortdramaSource[0].episodes.length);
-              // 检查是否已存在相同的短剧源，避免重复
-              const existingShortdrama = sourcesInfo.find(
-                (s) => s.source === 'shortdrama' && s.id === shortdramaId
-              );
-              if (!existingShortdrama) {
-                sourcesInfo.push(...shortdramaSource);
-                // 重新设置 availableSources 以包含短剧源（按权重排序）
-                sourcesInfo = await setAvailableSourcesWithWeight(sourcesInfo);
-                console.log('✅ 短剧源已添加到换源列表');
-              } else {
-                console.log('⚠️ 短剧源已存在，跳过添加');
-              }
-            } else {
-              console.log('⚠️ 短剧源没有有效的集数数据，跳过添加', {
-                length: shortdramaSource.length,
-                hasEpisodes: shortdramaSource[0]?.episodes,
-                episodesLength: shortdramaSource[0]?.episodes?.length
-              });
-            }
-          } catch (error) {
-            console.error('❌ 添加短剧源失败:', error);
+      // 如果已经有了source和id，优先通过单个详情接口快速获取
+      if (currentSource && currentId) {
+        // 先快速获取当前源的详情
+        try {
+          console.log('[Play] 获取当前源详情:', currentSource, currentId);
+          const currentSourceDetail = await fetchSourceDetail(
+            currentSource,
+            currentId,
+            searchTitle || videoTitle
+          );
+          console.log('[Play] 获取到的详情:', currentSourceDetail);
+          if (currentSourceDetail.length > 0) {
+            detailData = currentSourceDetail[0];
+            sourcesInfo = currentSourceDetail;
+            console.log('[Play] 设置 detailData 和 sourcesInfo 成功');
+          } else {
+            console.error('[Play] fetchSourceDetail 返回空数组');
           }
+        } catch (err) {
+          console.error('获取当前源详情失败:', err);
         }
+
+        // 异步获取其他源信息，不阻塞播放
+        setBackgroundSourcesLoading(true);
+        fetchSourcesData(searchTitle || videoTitle).then((sources) => {
+          // 合并当前源和搜索到的其他源
+          const allSources = [...sourcesInfo];
+          sources.forEach((source) => {
+            // 避免重复添加当前源
+            if (!(source.source === currentSource && source.id === currentId)) {
+              allSources.push(source);
+            }
+          });
+          setAvailableSources(allSources);
+          setBackgroundSourcesLoading(false);
+        }).catch((err) => {
+          console.error('异步获取其他源失败:', err);
+          setBackgroundSourcesLoading(false);
+        });
+      } else {
+        // 没有source和id，正常搜索流程
+        sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
       }
-      if (sourcesInfo.length === 0) {
+
+      if (!detailData && sourcesInfo.length === 0) {
         setError('未找到匹配结果');
         setLoading(false);
         return;
       }
 
-      let detailData: SearchResult = sourcesInfo[0];
+      if (!detailData) {
+        detailData = sourcesInfo[0];
+      }
       // 指定源和id且无需优选
       if (currentSource && currentId && !needPreferRef.current) {
         const target = sourcesInfo.find(
@@ -2705,6 +2749,15 @@ function PlayPageClient() {
         );
         if (target) {
           detailData = target;
+
+          // 如果是 emby 源且 episodes 为空，需要调用 detail 接口获取完整信息
+          if ((detailData.source === 'emby' || detailData.source.startsWith('emby_')) && (!detailData.episodes || detailData.episodes.length === 0)) {
+            console.log('[Play] Emby source has no episodes, fetching detail...');
+            const detailSources = await fetchSourceDetail(currentSource, currentId, searchTitle || videoTitle);
+            if (detailSources.length > 0) {
+              detailData = detailSources[0];
+            }
+          }
         } else {
           setError('未找到匹配结果');
           setLoading(false);
@@ -2720,10 +2773,43 @@ function PlayPageClient() {
         setLoadingStage('preferring');
         setLoadingMessage('⚡ 正在优选最佳播放源...');
 
-        detailData = await preferBestSource(sourcesInfo);
+        // 过滤掉 emby 源，它们不参与测速
+        const sourcesToTest = sourcesInfo.filter(s => {
+          // 检查是否为 emby 源（包括 emby 和 emby_xxx 格式）
+          if (s.source === 'emby' || s.source.startsWith('emby_')) return false;
+          return true;
+        });
+
+        const excludedSources = sourcesInfo.filter(s =>
+          s.source === 'emby' || s.source.startsWith('emby_')
+        );
+
+        if (sourcesToTest.length > 0) {
+          detailData = await preferBestSource(sourcesToTest);
+        } else if (excludedSources.length > 0) {
+          // 如果只有 emby 源，直接使用第一个
+          detailData = excludedSources[0];
+        } else {
+          detailData = sourcesInfo[0];
+        }
+      }
+
+      if (!detailData) {
+        setError('未找到匹配结果');
+        setLoading(false);
+        return;
       }
 
       console.log(detailData.source, detailData.id);
+
+      // 如果是 emby 源且 episodes 为空，需要调用 detail 接口获取完整信息
+      if ((detailData.source === 'emby' || detailData.source.startsWith('emby_')) && (!detailData.episodes || detailData.episodes.length === 0)) {
+        console.log('[Play] Emby source has no episodes, fetching detail...');
+        const detailSources = await fetchSourceDetail(detailData.source, detailData.id, detailData.title || videoTitleRef.current);
+        if (detailSources.length > 0) {
+          detailData = detailSources[0];
+        }
+      }
 
       setNeedPrefer(false);
       setCurrentSource(detailData.source);
@@ -2895,15 +2981,34 @@ function PlayPageClient() {
         return;
       }
 
+      // 如果是 emby 源且 episodes 为空，需要调用 detail 接口获取完整信息
+      let detailToUse = newDetail;
+      if ((newDetail.source === 'emby' || newDetail.source.startsWith('emby_')) && (!newDetail.episodes || newDetail.episodes.length === 0)) {
+        console.log('[Play] Emby source has no episodes after switch, fetching detail...');
+        try {
+          const { source: apiSource, embyKey } = parseSourceForApi(newSource);
+          const embyKeyParam = embyKey ? `&embyKey=${embyKey}` : '';
+          const detailResponse = await fetch(`/api/emby/detail?id=${newId}${embyKeyParam}`);
+          if (detailResponse.ok) {
+            const detailSources = (await detailResponse.json()) as SearchResult[];
+            if (detailSources.length > 0) {
+              detailToUse = detailSources[0];
+            }
+          }
+        } catch (err) {
+          console.error('[Play] Failed to fetch Emby detail:', err);
+        }
+      }
+
       // 🔥 换源时保持当前集数不变（除非新源集数不够）
       let targetIndex = currentEpisodeIndex;
 
       // 只有当新源的集数不够时才调整到最后一集或第一集
-      if (newDetail.episodes && newDetail.episodes.length > 0) {
-        if (targetIndex >= newDetail.episodes.length) {
+      if (detailToUse.episodes && detailToUse.episodes.length > 0) {
+        if (targetIndex >= detailToUse.episodes.length) {
           // 当前集数超出新源范围，跳转到新源的最后一集
-          targetIndex = newDetail.episodes.length - 1;
-          console.log(`⚠️ 当前集数(${currentEpisodeIndex})超出新源范围(${newDetail.episodes.length}集)，跳转到第${targetIndex + 1}集`);
+          targetIndex = detailToUse.episodes.length - 1;
+          console.log(`⚠️ 当前集数(${currentEpisodeIndex})超出新源范围(${detailToUse.episodes.length}集)，跳转到第${targetIndex + 1}集`);
           // 🔥 集数变化时，清除保存的临时进度
           const tempProgressKey = `temp_progress_${newSource}_${newId}_${currentEpisodeIndex}`;
           sessionStorage.removeItem(tempProgressKey);
@@ -2920,18 +3025,18 @@ function PlayPageClient() {
       const newUrl = new URL(window.location.href);
       newUrl.searchParams.set('source', newSource);
       newUrl.searchParams.set('id', newId);
-      newUrl.searchParams.set('year', newDetail.year);
+      newUrl.searchParams.set('year', detailToUse.year);
       newUrl.searchParams.set('index', targetIndex.toString());  // 🔥 同步URL的index参数
       window.history.replaceState({}, '', newUrl.toString());
 
-      setVideoTitle(newDetail.title || newTitle);
-      setVideoYear(newDetail.year);
-      setVideoCover(newDetail.poster);
+      setVideoTitle(detailToUse.title || newTitle);
+      setVideoYear(detailToUse.year);
+      setVideoCover(detailToUse.poster);
       // 优先保留URL参数中的豆瓣ID，如果URL中没有则使用详情数据中的
-      setVideoDoubanId(videoDoubanIdRef.current || newDetail.douban_id || 0);
+      setVideoDoubanId(videoDoubanIdRef.current || detailToUse.douban_id || 0);
       setCurrentSource(newSource);
       setCurrentId(newId);
-      setDetail(newDetail);
+      setDetail(detailToUse);
 
       // 🔥 只有当集数确实改变时才调用 setCurrentEpisodeIndex
       // 这样可以避免触发不必要的 useEffect 和集数切换逻辑
@@ -3318,6 +3423,38 @@ function PlayPageClient() {
   // ---------------------------------------------------------------------------
   // 收藏相关
   // ---------------------------------------------------------------------------
+
+  // 在收藏列表中查找匹配的收藏（按 key 精确匹配 + 按 title 模糊匹配）
+  const findMatchedFavoriteKey = useCallback((
+    favorites: Record<string, any>,
+  ): string | null => {
+    // 1. 精确匹配：当前源 key
+    const currentKey = currentSource && currentId ? `${currentSource}+${currentId}` : null;
+    if (currentKey && favorites[currentKey]) return currentKey;
+
+    // 2. 精确匹配：豆瓣/Bangumi/短剧虚拟源
+    if (videoDoubanId) {
+      const doubanKey = `douban+${videoDoubanId}`;
+      if (favorites[doubanKey]) return doubanKey;
+      const bangumiKey = `bangumi+${videoDoubanId}`;
+      if (favorites[bangumiKey]) return bangumiKey;
+    }
+    if (shortdramaId) {
+      const sdKey = `shortdrama+${shortdramaId}`;
+      if (favorites[sdKey]) return sdKey;
+    }
+
+    // 3. 按 title 匹配：同一部片在不同源有不同 source+id，用标题兜底
+    const title = videoTitleRef.current;
+    if (title) {
+      for (const [key, fav] of Object.entries(favorites)) {
+        if ((fav as any)?.title === title) return key;
+      }
+    }
+
+    return null;
+  }, [currentSource, currentId, videoDoubanId, shortdramaId]);
+
   // 每当 source 或 id 变化时检查收藏状态（支持豆瓣/Bangumi等虚拟源）
   useEffect(() => {
     if (!currentSource || !currentId) return;
@@ -3325,22 +3462,14 @@ function PlayPageClient() {
       try {
         const favorites = await getAllFavorites();
 
-        // 检查多个可能的收藏key
-        const possibleKeys = [
-          `${currentSource}+${currentId}`, // 当前真实播放源
-          videoDoubanId ? `douban+${videoDoubanId}` : null, // 豆瓣收藏
-          videoDoubanId ? `bangumi+${videoDoubanId}` : null, // Bangumi收藏
-          shortdramaId ? `shortdrama+${shortdramaId}` : null, // 短剧收藏
-        ].filter(Boolean);
-
-        // 检查是否任一key已被收藏
-        const fav = possibleKeys.some(key => !!favorites[key as string]);
-        setFavorited(fav);
+        const matchedKey = findMatchedFavoriteKey(favorites);
+        favoritedKeyRef.current = matchedKey;
+        setFavorited(!!matchedKey);
       } catch (err) {
         console.error('检查收藏状态失败:', err);
       }
     })();
-  }, [currentSource, currentId, videoDoubanId, shortdramaId]);
+  }, [currentSource, currentId, videoDoubanId, shortdramaId, findMatchedFavoriteKey]);
 
   // 监听收藏数据更新事件（支持豆瓣/Bangumi等虚拟源）
   useEffect(() => {
@@ -3349,22 +3478,14 @@ function PlayPageClient() {
     const unsubscribe = subscribeToDataUpdates(
       'favoritesUpdated',
       (favorites: Record<string, any>) => {
-        // 检查多个可能的收藏key
-        const possibleKeys = [
-          generateStorageKey(currentSource, currentId), // 当前真实播放源
-          videoDoubanId ? `douban+${videoDoubanId}` : null, // 豆瓣收藏
-          videoDoubanId ? `bangumi+${videoDoubanId}` : null, // Bangumi收藏
-          shortdramaId ? `shortdrama+${shortdramaId}` : null, // 短剧收藏
-        ].filter(Boolean);
-
-        // 检查是否任一key已被收藏
-        const isFav = possibleKeys.some(key => !!favorites[key as string]);
-        setFavorited(isFav);
+        const matchedKey = findMatchedFavoriteKey(favorites);
+        favoritedKeyRef.current = matchedKey;
+        setFavorited(!!matchedKey);
       }
     );
 
     return unsubscribe;
-  }, [currentSource, currentId, videoDoubanId, shortdramaId]);
+  }, [currentSource, currentId, videoDoubanId, shortdramaId, findMatchedFavoriteKey]);
 
   // 自动更新收藏的集数和片源信息（支持豆瓣/Bangumi/短剧等虚拟源）
   useEffect(() => {
@@ -3375,26 +3496,9 @@ function PlayPageClient() {
         const realEpisodes = detail.episodes.length || 1;
         const favorites = await getAllFavorites();
 
-        // 检查多个可能的收藏key
-        const possibleKeys = [
-          `${currentSource}+${currentId}`, // 当前真实播放源
-          videoDoubanId ? `douban+${videoDoubanId}` : null, // 豆瓣收藏
-          videoDoubanId ? `bangumi+${videoDoubanId}` : null, // Bangumi收藏
-        ].filter(Boolean);
-
-        let favoriteToUpdate = null;
-        let favoriteKey = '';
-
-        // 找到已存在的收藏
-        for (const key of possibleKeys) {
-          if (favorites[key as string]) {
-            favoriteToUpdate = favorites[key as string];
-            favoriteKey = key as string;
-            break;
-          }
-        }
-
-        if (!favoriteToUpdate) return;
+        const favoriteKey = findMatchedFavoriteKey(favorites);
+        if (!favoriteKey) return;
+        const favoriteToUpdate = favorites[favoriteKey];
 
         // 检查是否需要更新（集数不同或缺少片源信息）
         const needsUpdate =
@@ -3474,14 +3578,18 @@ function PlayPageClient() {
       return;
 
     if (favorited) {
-      // 如果已收藏，删除收藏
+      // 如果已收藏，使用实际存储的key来删除（可能和当前源不同）
+      const keyToDelete = favoritedKeyRef.current || `${currentSourceRef.current}+${currentIdRef.current}`;
+      const [delSource, delId] = keyToDelete.split('+');
+
       deleteFavoriteMutation.mutate(
         {
-          source: currentSourceRef.current,
-          id: currentIdRef.current,
+          source: delSource,
+          id: delId,
         },
         {
           onSuccess: () => {
+            favoritedKeyRef.current = null;
             setFavorited(false);
           },
           onError: (err) => {
@@ -3510,6 +3618,8 @@ function PlayPageClient() {
         contentType = 'shortdrama';
       }
 
+      const newKey = `${currentSourceRef.current}+${currentIdRef.current}`;
+
       // 如果未收藏，添加收藏
       saveFavoriteMutation.mutate(
         {
@@ -3528,6 +3638,7 @@ function PlayPageClient() {
         },
         {
           onSuccess: () => {
+            favoritedKeyRef.current = newKey;
             setFavorited(true);
           },
           onError: (err) => {
@@ -3953,6 +4064,54 @@ function PlayPageClient() {
               return '打开弹幕设置面板';
             },
           },
+          {
+            width: 200,
+            html: '显示模式',
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>',
+            tooltip: (() => {
+              const mode = localStorage.getItem('video_object_fit') || 'contain';
+              const modeNames: Record<string, string> = {
+                'contain': '默认(完整显示)',
+                'cover': '填充(裁切)',
+                'fill': '拉伸(变形)'
+              };
+              return modeNames[mode] || '默认(完整显示)';
+            })(),
+            selector: [
+              {
+                html: '默认(完整显示)',
+                value: 'contain',
+                default: (localStorage.getItem('video_object_fit') || 'contain') === 'contain',
+              },
+              {
+                html: '填充(裁切)',
+                value: 'cover',
+                default: localStorage.getItem('video_object_fit') === 'cover',
+              },
+              {
+                html: '拉伸(变形)',
+                value: 'fill',
+                default: localStorage.getItem('video_object_fit') === 'fill',
+              },
+            ],
+            onSelect: function (item: any) {
+              const mode = item.value;
+              localStorage.setItem('video_object_fit', mode);
+
+              // 应用到当前视频元素
+              if (artPlayerRef.current?.video) {
+                artPlayerRef.current.video.style.objectFit = mode;
+              }
+
+              const modeNames: Record<string, string> = {
+                'contain': '默认(完整显示)',
+                'cover': '填充(裁切)',
+                'fill': '拉伸(变形)'
+              };
+
+              return modeNames[mode] || item.html;
+            },
+          },
           ...(webGPUSupported ? [
             {
               name: '超分设置',
@@ -4212,6 +4371,12 @@ function PlayPageClient() {
 
         // 使用ArtPlayer layers API添加分辨率徽章（带渐变和发光效果）
         const video = artPlayerRef.current.video as HTMLVideoElement;
+
+        // 🖥️ 应用保存的显示模式设置（支持超宽屏）
+        const savedObjectFit = localStorage.getItem('video_object_fit') || 'contain';
+        if (video) {
+          video.style.objectFit = savedObjectFit;
+        }
 
         // 添加分辨率徽章layer
         artPlayerRef.current.layers.add({
@@ -4874,7 +5039,17 @@ function PlayPageClient() {
         lastVolumeRef.current = artPlayerRef.current.volume;
       });
       artPlayerRef.current.on('video:ratechange', () => {
-        lastPlaybackRateRef.current = artPlayerRef.current.playbackRate;
+        lastPlaybackRateRef.current = sanitizePlaybackRate(
+          artPlayerRef.current.playbackRate,
+        );
+        try {
+          localStorage.setItem(
+            PLAYER_PLAYBACK_RATE_KEY,
+            String(lastPlaybackRateRef.current),
+          );
+        } catch {
+          // ignore
+        }
       });
 
       // 监听全屏事件，进入全屏后自动隐藏控制栏 + 显示标题层
@@ -5019,8 +5194,7 @@ function PlayPageClient() {
           if (
             Math.abs(
               artPlayerRef.current.playbackRate - lastPlaybackRateRef.current
-            ) > 0.01 &&
-            isWebKit
+            ) > 0.01
           ) {
             artPlayerRef.current.playbackRate = lastPlaybackRateRef.current;
           }
@@ -5883,11 +6057,11 @@ function PlayPageClient() {
           // 单集视频，直接下载当前
           const currentUrl = videoUrl;
           if (!currentUrl) {
-            alert('无法获取视频地址');
+            toast.error('无法获取视频地址');
             return;
           }
           if (!currentUrl.includes('.m3u8')) {
-            alert('仅支持M3U8格式视频下载');
+            toast.error('仅支持M3U8格式视频下载');
             return;
           }
           try {
@@ -5900,18 +6074,72 @@ function PlayPageClient() {
               referer,
               origin,
             });
+
+            // 显示 Toast 通知
+            toast.success('下载已开始', {
+              description: videoTitle || '视频',
+              action: {
+                label: '查看下载',
+                onClick: () => setShowDownloadPanel(true)
+              },
+              duration: 5000,
+            });
           } catch (error) {
             console.error('创建下载任务失败:', error);
-            alert('创建下载任务失败: ' + (error as Error).message);
+            toast.error('创建下载任务失败', {
+              description: (error as Error).message,
+              duration: 5000,
+            });
           }
           return;
         }
 
-        // 批量下载多集
+        // 批量下载多集 - 立即显示 toast
+        const taskCount = episodeIndexes.length;
+        toast.success('下载已开始', {
+          description: taskCount === 1
+            ? `${videoTitle || '视频'}_第${episodeIndexes[0] + 1}集`
+            : `正在添加 ${taskCount} 个下载任务...`,
+          action: {
+            label: '查看下载',
+            onClick: () => setShowDownloadPanel(true)
+          },
+          duration: 5000,
+        });
+
+        let successCount = 0;
+        let hasAttempted = false;
         for (const episodeIndex of episodeIndexes) {
+          hasAttempted = true;
           try {
-            const episodeUrl = detail.episodes[episodeIndex];
+            let episodeUrl = detail.episodes[episodeIndex];
             if (!episodeUrl) continue;
+
+            // 检查是否为短剧格式，需要先解析
+            if (episodeUrl.startsWith('shortdrama:')) {
+              try {
+                const [, videoId, episode] = episodeUrl.split(':');
+                const nameParam = detail.drama_name ? `&name=${encodeURIComponent(detail.drama_name)}` : '';
+                const response = await fetch(
+                  `/api/shortdrama/parse?id=${videoId}&episode=${episode}${nameParam}`
+                );
+
+                if (response.ok) {
+                  const result = await response.json();
+                  episodeUrl = result.url || '';
+                  if (!episodeUrl) {
+                    console.warn(`第${episodeIndex + 1}集解析失败，跳过`);
+                    continue;
+                  }
+                } else {
+                  console.warn(`第${episodeIndex + 1}集解析失败，跳过`);
+                  continue;
+                }
+              } catch (parseError) {
+                console.error(`第${episodeIndex + 1}集短剧URL解析失败:`, parseError);
+                continue;
+              }
+            }
 
             // 检查是否是M3U8
             if (!episodeUrl.includes('.m3u8')) {
@@ -5931,9 +6159,23 @@ function PlayPageClient() {
               referer,
               origin,
             });
+            successCount++;
           } catch (error) {
             console.error(`创建第${episodeIndex + 1}集下载任务失败:`, error);
           }
+        }
+
+        // 如果有失败的任务，显示错误提示
+        if (successCount === 0 && hasAttempted) {
+          toast.error('下载失败', {
+            description: '无法创建下载任务，请查看控制台了解详情',
+            duration: 5000,
+          });
+        } else if (successCount < taskCount) {
+          toast.warning('部分任务创建失败', {
+            description: `成功添加 ${successCount}/${taskCount} 个下载任务`,
+            duration: 5000,
+          });
         }
       }}
       />
